@@ -1092,13 +1092,15 @@ from typing import List, Any
 import joblib
 
 class TripInfoWithETAPCA(TripInfoWithETASumo):
+    """Combine the agent's base observation with a PCA-reduced SUMO edge state."""
+
     def __init__(self, *args, n_components: int = 35, **kwargs) -> None:
         if not isinstance(n_components, (int, np.integer)) or n_components <= 0:
             raise ValueError(f"n_components must be a positive integer, got {n_components!r}")
 
         self.n_components = n_components
         
-        pca_path = "/home/z1201158/URB_Dim_Reduction/URB/results/trained_pca_model.pkl"        
+        pca_path = "/scratch/tmp/dorosz/URB_Dim_Reduction/URB/results/trained_pca_model.pkl"        
         if not os.path.exists(pca_path):
             raise FileNotFoundError(f"Brak modelu PCA: {pca_path}")
             
@@ -1112,6 +1114,18 @@ class TripInfoWithETAPCA(TripInfoWithETASumo):
                 f"only {components.shape[0]}"
             )
         self.pca_input_size = int(components.shape[1])
+
+        # PCA jest fitowane na danych przeskalowanych, więc potrzebny jest ten sam
+        # scaler.pkl, którego używa runtime (patrz prepare_compression_data.py).
+        scaler_path = "/scratch/tmp/dorosz/URB_Dim_Reduction/URB/results/scaler.pkl"
+        if not os.path.exists(scaler_path):
+            raise FileNotFoundError(f"Brak skalera: {scaler_path}")
+        self.scaler = joblib.load(scaler_path)
+        if int(getattr(self.scaler, "n_features_in_", 0)) != self.pca_input_size:
+            raise ValueError(
+                f"Scaler oczekuje {getattr(self.scaler, 'n_features_in_', 0)} cech, "
+                f"ale model PCA oczekuje {self.pca_input_size}"
+            )
 
         super().__init__(*args, **kwargs)
         self.OBS_SIZE = self.BASE_OBS_SIZE + self.n_components
@@ -1161,7 +1175,12 @@ class TripInfoWithETAPCA(TripInfoWithETASumo):
         base_obs = full_obs[:base_obs_len]
         edge_vec = full_obs[base_obs_len:]
 
-        reduced = np.asarray(self.pca.transform(edge_vec.reshape(1, -1)), dtype=np.float32)
+        # Najpierw scaler, potem PCA (model był fitowany na przeskalowanych danych)
+        edge_scaled = np.asarray(
+            self.scaler.transform(edge_vec.reshape(1, -1)),
+            dtype=np.float32,
+        )
+        reduced = np.asarray(self.pca.transform(edge_scaled), dtype=np.float32)
         if reduced.ndim != 2 or reduced.shape[0] != 1 or reduced.shape[1] < self.n_components:
             raise RuntimeError(
                 f"PCA returned shape {reduced.shape}; expected one row with at least "
@@ -1170,7 +1189,7 @@ class TripInfoWithETAPCA(TripInfoWithETASumo):
         reduced_edge_vec = reduced[0, :self.n_components]
         final_obs = _validate_observation_size(
             np.concatenate([base_obs, reduced_edge_vec]),
-            self.BASE_OBS_SIZE + self.n_components,  # <--- BEZPIECZNY WYMIAR
+            self.BASE_OBS_SIZE + self.n_components,  
             f"PCA observation for agent {agent_id}",
         )
         
@@ -1195,7 +1214,6 @@ class ObservationPCAOnly(TripInfoWithETAPCA):
     """
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Nadpisujemy rozmiar Gym Space na same komponenty PCA
         self.OBS_SIZE = self.n_components 
         self.observations = self.reset_observation()
 
@@ -1293,14 +1311,12 @@ class ObservationPrivateAndAE(TripInfoWithETASumo):
             raise ValueError(f"latent_dim must be a positive integer, got {latent_dim!r}")
         self.latent_dim = latent_dim
         
-        # Ścieżki do zapisanych plików modelu i skalera (zmień ścieżkę absolutną, jeśli to konieczne)
-        model_path = "/home/z1201158/URB_Dim_Reduction/URB/results/trained_encoder.pt"
-        scaler_path = "/home/z1201158/URB_Dim_Reduction/URB/results/scaler.pkl"
+        model_path = "/scratch/tmp/dorosz/URB_Dim_Reduction/URB/results/trained_encoder.pt"
+        scaler_path = "/scratch/tmp/dorosz/URB_Dim_Reduction/URB/results/scaler.pkl"
         
         if not os.path.exists(model_path) or not os.path.exists(scaler_path):
             raise FileNotFoundError("Brak plików Autoenkodera! Upewnij się, że trained_encoder.pt i scaler.pkl istnieją.")
             
-        # 1. Wczytanie skalera
         self.scaler = joblib.load(scaler_path)
         input_dim = getattr(self.scaler, "n_features_in_", None)
         if not isinstance(input_dim, (int, np.integer)) or input_dim <= 0:
@@ -1310,7 +1326,6 @@ class ObservationPrivateAndAE(TripInfoWithETASumo):
             )
         self.encoder_input_size = int(input_dim)
         
-       # 2. Definicja i wczytanie architektury Kodera (wymuszamy CPU)
         self.device = torch.device("cpu")
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, 512),
@@ -1320,11 +1335,9 @@ class ObservationPrivateAndAE(TripInfoWithETASumo):
             nn.Linear(128, self.latent_dim)
         )
         
-        # Ładujemy wagi bezpośrednio do pamięci RAM (CPU)
         self.encoder.load_state_dict(torch.load(model_path, map_location=self.device))
-        self.encoder.eval() # Wyłączamy tryb treningu (Dropout/BatchNorm)
+        self.encoder.eval() 
 
-        # 3. Inicjalizacja klasy bazowej SUMO
         super().__init__(*args, **kwargs)
         self.OBS_SIZE = self.BASE_OBS_SIZE + self.latent_dim
         self.observations = self.reset_observation()
@@ -1369,7 +1382,6 @@ class ObservationPrivateAndAE(TripInfoWithETASumo):
             f"SUMO observation for agent {agent_id}",
         )
 
-        # Rozdzielenie na część prywatną i gigantyczny wektor z SUMO
         base_obs_len = len(full_obs) - self.edge_vec_len
         base_obs = full_obs[:base_obs_len]
         edge_vec = full_obs[base_obs_len:]
@@ -1402,7 +1414,7 @@ class ObservationPrivateAndAE(TripInfoWithETASumo):
             
         final_obs = _validate_observation_size(
             np.concatenate([base_obs, ae_out]),
-            self.BASE_OBS_SIZE + self.latent_dim,  # <--- BEZPIECZNY WYMIAR
+            self.BASE_OBS_SIZE + self.latent_dim, 
             f"Autoencoder observation for agent {agent_id}",
         )
         
