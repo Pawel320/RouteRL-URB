@@ -32,6 +32,8 @@ class Keychain:
     BEHAVIOR = "behavior"
     OBSERVED_SPAN = "observed_span"
     OBSERVATION_TYPE = "observation_type"
+    OBSERVATION_SPLIT = "observation_split"
+    CLUSTER_OBSERVATION_TYPES = "cluster_observation_types"
     PREVIOUS_AGENTS = "previous_agents"
     PREVIOUS_AGENTS_PLUS_START_TIME = "previous_agents_plus_start_time"
     PREVIOUS_AGENTS_PLUS_START_TIME_DETECTOR_DATA = "previous_agents_plus_start_time_detector_data"

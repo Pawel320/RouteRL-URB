@@ -95,6 +95,20 @@ class TrafficEnvironment(AECEnv):
                     Type of observation.
                     Options: ``previous_agents``, ``previous_agents_plus_start_time``, ``trip_info_eta``, ``trip_info_eta``, ``trip_info_eta_mask_norm``, ``trip_info_eta_route_congestion``, ``route_congestion``, ``trip_info_eta_sumo``.
 
+                - observation_split (bool, default=False):
+                    Give each cluster its own observation type instead of one global
+                    ``observation_type``. Requires ``cluster_observation_types``.
+                    When False (default) behaviour is unchanged: every machine agent
+                    shares ``observation_type``.
+
+                - cluster_observation_types (dict, default={"0": "trip_info_eta", "1": "trip_info_eta"}):
+                    Cluster label -> observation type, used only when
+                    ``observation_split`` is True. Both ``"0"`` and ``"1"`` must be
+                    present. Each cluster gets its own observation object, so
+                    normalization and action masking only happen for the clusters
+                    whose type calls for them, and observation sizes may differ
+                    between clusters.
+
             - human_parameters (**dict**): 
                 Human agent settings.
                 
@@ -359,12 +373,24 @@ class TrafficEnvironment(AECEnv):
         self.use_clustered_routes = self.action_masks is not None # for the simulator
 
         self.recorder = Recorder(self.plotter_params)
-        observation_type = self.agent_params[kc.MACHINE_PARAMETERS][kc.OBSERVATION_TYPE]
-        use_edge_subscriptions = observation_type in {
+        machine_params = self.agent_params[kc.MACHINE_PARAMETERS]
+        observation_type = machine_params[kc.OBSERVATION_TYPE]
+        self.observation_split = machine_params[kc.OBSERVATION_SPLIT]
+        self.cluster_observation_types = machine_params[kc.CLUSTER_OBSERVATION_TYPES]
+        self.agent_cluster_map = None  # stamped later, see set_cluster_assignment()
+
+        # Edge subscriptions are a single simulator-wide switch, so a split
+        # environment has to subscribe for every type any of its clusters uses.
+        observed_types = (
+            set(self.cluster_observation_types.values())
+            if self.observation_split
+            else {observation_type}
+        )
+        use_edge_subscriptions = bool(observed_types & {
             kc.TRIP_INFO_ETA_SUMO,
             kc.TRIP_INFO_ETA_ROUTE_CONGESTION,
             kc.ROUTE_CONGESTION,
-        }
+        })
         self.simulator = SumoSimulator(
             self.simulation_params,
             self.path_gen_params,
@@ -429,6 +455,31 @@ class TrafficEnvironment(AECEnv):
 
         logging.info("\nMachine's observation space is: %s ", self._observation_spaces)
         logging.info("Machine's action space is: %s", self._action_spaces)
+
+    def set_cluster_assignment(self, cluster_map: dict) -> None:
+        """Stamp per-cluster ids on the machine agents and rebuild observations.
+
+        The grouping CSV is only readable after ``mutation()`` (machine agents
+        do not exist before it), while observation objects are built during
+        ``__init__``/``mutation()``. Rebuilding through the very same
+        ``_initialize_machine_agents()`` path keeps a single lifecycle.
+
+        Args:
+            cluster_map (dict): machine agent id -> cluster label.
+        Returns:
+            None
+        """
+
+        self.agent_cluster_map = {int(agent_id): int(label) for agent_id, label in cluster_map.items()}
+        for agent in self.machine_agents:
+            agent.cluster_id = self.agent_cluster_map[int(agent.id)]
+
+        self._initialize_machine_agents()
+
+        # Observation and action spaces are cached per agent id only, so the
+        # shapes computed before this rebuild would otherwise be returned stale.
+        self.observation_space.cache_clear()
+        self.action_space.cache_clear()
 
     ################################
     ######## Control methods #######
@@ -978,6 +1029,11 @@ class TrafficEnvironment(AECEnv):
     def get_observation_function(self) -> Observations:
         """Returns an observation object based on the provided parameters.
 
+        When ``observation_split`` is enabled and a cluster assignment has
+        already been stamped on the agents, one object is built per cluster and
+        wrapped in a dispatcher, so every cluster gets exactly the observation
+        type (and therefore normalization/masking) its config asks for.
+
         Returns:
             Observations: An observation object.
         Raises:
@@ -986,16 +1042,31 @@ class TrafficEnvironment(AECEnv):
 
         params = self.agent_params[kc.MACHINE_PARAMETERS]
         observation_type = params[kc.OBSERVATION_TYPE]
+
+        if self.observation_split and self.agent_cluster_map is not None:
+            return ClusteredObservations(
+                self.machine_agents,
+                self.human_agents,
+                self.agent_cluster_map,
+                params[kc.CLUSTER_OBSERVATION_TYPES],
+                self._build_observation_object,
+            )
+
+        return self._build_observation_object(observation_type, self.machine_agents)
+
+    def _build_observation_object(self, observation_type: str, agents: list) -> Observations:
+        """Builds a single observation object for ``agents`` sharing one type."""
+
         if observation_type == kc.PREVIOUS_AGENTS_PLUS_START_TIME:
             return PreviousAgentStartPlusStartTime(
-                self.machine_agents,
+                agents,
                 self.human_agents,
                 self.simulation_params,
                 self.agent_params
             )
         elif observation_type == kc.PREVIOUS_AGENTS:
             return PreviousAgentStart(
-                self.machine_agents,
+                agents,
                 self.human_agents,
                 self.simulation_params,
                 self.agent_params
@@ -1005,7 +1076,7 @@ class TrafficEnvironment(AECEnv):
                 raise Exception("Detector info saving is disabled. Please set 'self.save_detectors_info = True' to proceed or change the observation type.")
             
             return PreviousAgentStartPlusStartTimeDetectorData(
-                self.machine_agents,
+                agents,
                 self.human_agents,
                 self.simulation_params,
                 self.plotter_params,
@@ -1014,7 +1085,7 @@ class TrafficEnvironment(AECEnv):
             )
         elif observation_type == kc.TRIP_INFO_ETA:
             return TripInfoWithETA(
-                self.machine_agents,
+                agents,
                 self.human_agents,
                 self.simulation_params,
                 self.agent_params,
@@ -1022,7 +1093,7 @@ class TrafficEnvironment(AECEnv):
             )
         elif observation_type == kc.TRIP_INFO_ETA_MASK_NORM:
             return TripInfoWithETAMaskNorm(
-                self.machine_agents,
+                agents,
                 self.human_agents,
                 self.simulation_params,
                 self.agent_params,
@@ -1032,7 +1103,7 @@ class TrafficEnvironment(AECEnv):
             )
         elif observation_type == kc.TRIP_INFO_ETA_ROUTE_CONGESTION:
             return TripInfoWithETARouteCongestion(
-                self.machine_agents,
+                agents,
                 self.human_agents,
                 self.simulation_params,
                 self.agent_params,
@@ -1043,7 +1114,7 @@ class TrafficEnvironment(AECEnv):
             )
         elif observation_type == kc.ROUTE_CONGESTION:
             return RouteCongestion(
-                self.machine_agents,
+                agents,
                 self.human_agents,
                 self.simulation_params,
                 self.agent_params,
@@ -1054,7 +1125,7 @@ class TrafficEnvironment(AECEnv):
             )
         elif observation_type == kc.TRIP_INFO_ETA_SUMO:
             return TripInfoWithETASumo(
-                self.machine_agents,
+                agents,
                 self.human_agents,
                 self.simulation_params,
                 self.agent_params,

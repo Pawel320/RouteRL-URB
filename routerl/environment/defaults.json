@@ -9,6 +9,8 @@
             "behavior" : "selfish",
             "observed_span" : 300,
             "observation_type" : "trip_info_eta",
+            "observation_split": false,
+            "cluster_observation_types" : { "0": "trip_info_eta", "1": "trip_info_eta" },
             "group_vicinity": false
         },
 

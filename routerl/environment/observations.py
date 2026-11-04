@@ -7,7 +7,7 @@ import numpy as np
 from abc import ABC, abstractmethod
 import os
 import pandas as pd
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Callable
 import traci.constants as tc
 
 from routerl.keychain import Keychain as kc
@@ -1070,3 +1070,116 @@ class TripInfoWithETASumo(TripInfoWithETAMaskNorm):
         full_obs = np.concatenate([np.array(base_obs, dtype=np.float32), edge_vec])
         self.observations[str(agent_id)] = full_obs.copy()
         return full_obs
+
+
+class ClusteredObservations(Observations):
+    """Dispatches observations to one observation object per cluster.
+
+    Used when ``observation_split`` is enabled: every cluster keeps exactly the
+    observation type its config asks for, so normalization, masking and
+    free-flow padding happen only inside the clusters whose type demands them.
+
+    Agents are partitioned between the children rather than shared, which makes
+    the merged observation and observation-space dictionaries complete and
+    collision free without any conflict resolution. The children still compute
+    their scales from the global free-flows and action masks, so a split that
+    gives both clusters the same type produces identical values to a non-split
+    environment.
+    """
+
+    def __init__(
+        self,
+        machine_agents_list: List[Any],
+        human_agents_list: List[Any],
+        agent_cluster_map: Dict[int, int],
+        observation_types: Dict[str, str],
+        builder: Callable[[str, List[Any]], "Observations"],
+    ) -> None:
+        """Initialize the dispatcher.
+
+        Args:
+            machine_agents_list (List[Any]): All machine agents.
+            human_agents_list (List[Any]): All human agents.
+            agent_cluster_map (Dict[int, int]): machine agent id -> cluster label.
+            observation_types (Dict[str, str]): cluster label -> observation type.
+            builder (Callable): Builds one observation object for a type and a
+                list of agents (``TrafficEnvironment._build_observation_object``).
+        Returns:
+            None
+        """
+
+        Observations.__init__(self, machine_agents_list, human_agents_list)
+
+        self.agent_cluster_map = {
+            int(agent_id): str(label) for agent_id, label in agent_cluster_map.items()
+        }
+
+        agents_by_cluster: Dict[str, List[Any]] = {}
+        for agent in machine_agents_list:
+            if int(agent.id) not in self.agent_cluster_map:
+                raise ValueError(f"Missing cluster assignment for machine agent {agent.id}.")
+            label = self.agent_cluster_map[int(agent.id)]
+            agents_by_cluster.setdefault(label, []).append(agent)
+
+        self.sub_objects: Dict[str, Observations] = {}
+        for label, agents in agents_by_cluster.items():
+            observation_type = observation_types.get(label)
+            if observation_type is None:
+                raise ValueError(f"cluster_observation_types is missing cluster '{label}'.")
+            self.sub_objects[label] = builder(observation_type, agents)
+
+    def _object_for(self, agent_id) -> "Observations":
+        """Returns the observation object owning ``agent_id``."""
+
+        label = self.agent_cluster_map.get(int(agent_id))
+        if label is None:
+            raise ValueError(f"Missing cluster assignment for machine agent {agent_id}.")
+        return self.sub_objects[label]
+
+    @property
+    def observations(self) -> Dict[str, Any]:
+        """Merged observations of every cluster, keyed by agent id."""
+
+        merged = {}
+        for obj in self.sub_objects.values():
+            merged.update(obj.observations)
+        return merged
+
+    def __call__(self, all_agents: List[Any]) -> Dict[str, Any]:
+        """Generate observations for all agents of every cluster."""
+
+        merged = {}
+        for obj in self.sub_objects.values():
+            merged.update(obj(all_agents))
+        return merged
+
+    def reset_observation(self) -> Dict[str, np.ndarray]:
+        """Reset observations of every cluster to their initial state."""
+
+        merged = {}
+        for obj in self.sub_objects.values():
+            merged.update(obj.reset_observation())
+        return merged
+
+    def observation_space(self) -> Dict[str, Box]:
+        """Merged observation spaces of every cluster, keyed by agent id."""
+
+        merged = {}
+        for obj in self.sub_objects.values():
+            merged.update(obj.observation_space())
+        return merged
+
+    def refresh_edge_metadata(self) -> None:
+        """Forward edge metadata refreshing to the clusters that need it."""
+
+        for obj in self.sub_objects.values():
+            refresh = getattr(obj, "refresh_edge_metadata", None)
+            if refresh is not None:
+                refresh()
+
+    def agent_observations(self, agent_id: str, all_agents: List[Any], agent_selection: str, travel_times: List[Any]) -> np.ndarray:
+        """Retrieve the observation of the cluster owning ``agent_id``."""
+
+        return self._object_for(agent_id).agent_observations(
+            agent_id, all_agents, agent_selection, travel_times
+        )

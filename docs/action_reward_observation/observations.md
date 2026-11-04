@@ -7,6 +7,22 @@ firstpage:
 
 RouteRL provides the observation classes described below. Users can also create custom observations by inheriting from the `Observations` base class.
 
+## One observation type per cluster
+
+By default a single `observation_type` is used for every machine agent. Setting `observation_split: true` in `machine_parameters` instead requires `cluster_observation_types`, a mapping from cluster label to observation type:
+
+```json
+"observation_split": true,
+"cluster_observation_types": { "0": "trip_info_eta", "1": "trip_info_eta_mask_norm" }
+```
+
+The environment then builds one observation object per cluster and wraps them in `ClusteredObservations`, which dispatches `agent_observations` to the object owning each agent and merges the observation dictionaries and observation spaces. Two consequences:
+
+* **Normalization and action masking only apply where the type demands them.** With the mapping above, cluster 1 gets ETA mask-normalization (values divided by `eta_scale` and clipped) while cluster 0 sees raw, unnormalized free-flow times. Each object computes its own scales and masks from the global free-flows and action masks, so giving both clusters the same type produces exactly the same values as a non-split environment.
+* **Observation sizes may differ between clusters**, because each cluster's vector is laid out by its own class. Consumers must read the size per cluster rather than assuming one global size.
+
+Agent ids are partitioned between the cluster objects, so the merged dictionaries are complete without any conflict resolution. `observation_split` defaults to `false`, which keeps the original single-object behaviour unchanged.
+
 ## PreviousAgentStart
 The observation for each agent is represented as a vector of size $\mathcal{A}_j$, as the action space for an agent $j$, corresponding to the number of available actions. The value at position $i$ in the vector indicates the number of agents that selected route $i$ in the current episode and have a start time earlier than the given agent.
 
